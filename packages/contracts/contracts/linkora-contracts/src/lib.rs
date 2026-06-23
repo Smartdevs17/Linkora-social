@@ -4,6 +4,9 @@ use soroban_sdk::{
     Address, BytesN, Env, Map, String, Symbol, Vec,
 };
 
+#[cfg(test)]
+use soroban_sdk::testutils::storage::Persistent as _;
+
 // ── Storage Key Enum ──────────────────────────────────────────────────────────
 
 #[contracttype]
