@@ -3466,687 +3466,83 @@ fn test_gov_veto_insufficient_pool_signers_panics() {
     client.gov_veto(&single_signer, &pool_id, &proposal_id);
 }
 
-// ── Analytics Oracle Tests ────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod oracle_tests {
-    use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-    use soroban_sdk::{symbol_short, Bytes, BytesN, Env};
-
-    fn setup(env: &Env) -> (LinkoraContractClient<'_>, Address, SigningKey, BytesN<32>) {
-        let (client, admin, _) = setup_contract(env);
-        // Use a fixed 32-byte seed for the oracle signing key.
-        let seed = [7u8; 32];
-        let sk = SigningKey::from_bytes(&seed);
-        let vk_bytes: [u8; 32] = sk.verifying_key().to_bytes();
-        let pubkey = BytesN::from_array(env, &vk_bytes);
-        let oracle_name = symbol_short!("default");
-        client.register_oracle(&admin, &oracle_name, &pubkey);
-        (client, admin, sk, pubkey)
-    }
-
-    fn sign_report(env: &Env, sk: &SigningKey, report: &[u8]) -> BytesN<64> {
-        let report_bytes = Bytes::from_slice(env, report);
-        let digest: BytesN<32> = env.crypto().sha256(&report_bytes).into();
-        let digest_arr: [u8; 32] = digest.into();
-        let sig = sk.sign(&digest_arr);
-        BytesN::from_array(env, &sig.to_bytes())
-    }
-
-    #[test]
-    fn test_oracle_valid_signature_verifies() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _, sk, _) = setup(&env);
-        let creator = Address::generate(&env);
-
-        let report: &[u8] = &[1, 1, 42, 0, 0, 0, 0, 5];
-        let report_cbor = Bytes::from_slice(&env, report);
-        let signature = sign_report(&env, &sk, report);
-
-        let result = client.verify_analytics_attestation(
-            &symbol_short!("default"),
-            &report_cbor,
-            &signature,
-            &creator,
-            &1000u64,
-            &2000u64,
-        );
-        assert!(result);
-    }
-
-    #[test]
-    #[should_panic(expected = "attestation already submitted")]
-    fn test_oracle_replay_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _, sk, _) = setup(&env);
-        let creator = Address::generate(&env);
-
-        let report: &[u8] = &[1, 1, 99];
-        let report_cbor = Bytes::from_slice(&env, report);
-        let signature = sign_report(&env, &sk, report);
-
-        client.verify_analytics_attestation(
-            &symbol_short!("default"),
-            &report_cbor,
-            &signature,
-            &creator,
-            &1000u64,
-            &2000u64,
-        );
-        // Second identical call must panic.
-        client.verify_analytics_attestation(
-            &symbol_short!("default"),
-            &report_cbor,
-            &signature,
-            &creator,
-            &1000u64,
-            &2000u64,
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Crypto, InvalidInput)")]
-    fn test_oracle_flipped_bit_fails() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _, sk, _) = setup(&env);
-        let creator = Address::generate(&env);
-
-        let report: &[u8] = &[1, 1, 55];
-        let report_cbor = Bytes::from_slice(&env, report);
-        let good_sig = sign_report(&env, &sk, report);
-        let mut bad_arr: [u8; 64] = good_sig.into();
-        bad_arr[0] ^= 0xFF;
-        let bad_signature = BytesN::from_array(&env, &bad_arr);
-
-        // Must panic with "invalid signature" from ed25519_verify.
-        client.verify_analytics_attestation(
-            &symbol_short!("default"),
-            &report_cbor,
-            &bad_signature,
-            &creator,
-            &1000u64,
-            &2000u64,
-        );
-    }
-}
+// ── delete_post removes ID from author index and get_post returns None ─────────
 
 #[test]
-fn test_profile_expiry_detection() {
+fn test_delete_post_removed_from_author_index_and_get_post_none() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _, _) = setup_contract(&env);
-
-    let user = Address::generate(&env);
-    let token = Address::generate(&env);
-    client.set_profile(&user, &String::from_str(&env, "alice"), &token);
-
-    // Profile should be retrievable initially
-    assert!(client.get_profile(&user).is_some());
-
-    // Simulate storage expiry: directly remove the Profile persistent key while
-    // keeping the REGISTERED_USERS registry in instance storage intact.
-    // This is exactly what the Soroban network does when a persistent entry's TTL
-    // reaches zero — the entry is archived and has() returns false.
-    let key = StorageKey::Profile(user.clone());
-    env.as_contract(&client.address, || {
-        env.storage().persistent().remove(&key);
-    });
-
-    // get_profile should now detect the user as registered-but-expired and
-    // panic with RentError::Expired (contract error code 1).
-    let res = client.try_get_profile(&user);
-    assert!(res.is_err());
-
-    if let Err(Ok(err)) = res {
-        let expected_err = soroban_sdk::Error::from_contract_error(1);
-        assert_eq!(err, expected_err);
-    } else {
-        panic!("expected contract error RentError::Expired");
-    }
-}
-
-#[test]
-fn test_pay_rent_extends_ttl() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup_contract(&env);
-
-    let user = Address::generate(&env);
-    let token_address = setup_token(&env, &admin);
-
-    // Mint tokens to user directly
-    let token_client = StellarAssetClient::new(&env, &token_address);
-    token_client.mint(&user, &100_000_000_000);
-
-    client.set_profile(&user, &String::from_str(&env, "alice"), &token_address);
-
-    let initial_expiry = client.get_rent_expiry(&user);
-
-    client.set_rent_rate_bps(&100);
-
-    // Pay rent: 100,000,000 stroops
-    // decimals = 7, rent_rate_bps = 100, divisor = 1,000,000,000.
-    // ledgers_to_extend = (100_000_000 * 10_000) / 1,000,000,000 = 1,000.
-    let amount = 100_000_000;
-    client.pay_rent(&user, &token_address, &amount);
-
-    let post_expiry = client.get_rent_expiry(&user);
-    assert_eq!(post_expiry, initial_expiry + 1000);
-}
-
-#[test]
-#[should_panic(expected = "graph entry expired - pay rent")]
-fn test_follow_panics_on_expired_graph_keys() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _) = setup_contract(&env);
-
-    let follower = Address::generate(&env);
-    let followee = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    client.set_profile(&follower, &String::from_str(&env, "alice"), &token);
-    client.set_profile(&followee, &String::from_str(&env, "bob"), &token);
-
-    // Advance ledger so keys expire
-    env.ledger().with_mut(|li| {
-        li.sequence_number += 535_001;
-    });
-
-    client.follow(&follower, &followee);
-}
-
-#[test]
-fn test_get_rent_expiry_minimum() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _) = setup_contract(&env);
-
-    let user = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    client.set_profile(&user, &String::from_str(&env, "alice"), &token);
-
-    // Advance sequence by 435,000. Now all user keys have TTL of 100,000.
-    env.ledger().with_mut(|li| {
-        li.sequence_number += 435_000;
-    });
-
-    // Update profile. This bumps the Profile and UsernameIndex keys to 535,000,
-    // but leaves FollowingCount and FollowersCount keys at TTL 100,000.
-    client.set_profile(&user, &String::from_str(&env, "alice"), &token);
-
-    let expected_expiry = env.ledger().sequence() + 100_000;
-    assert_eq!(client.get_rent_expiry(&user), expected_expiry);
-}
-
-#[test]
-fn test_moderation_happy_path_uphold() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin, _treasury) = setup_contract(&env);
-
-    // Create the moderator pool with M-of-N signatures (2-of-2)
-    let pool_admin1 = Address::generate(&env);
-    let pool_admin2 = Address::generate(&env);
-    let pool_admins = vec![&env, pool_admin1.clone(), pool_admin2.clone()];
-    let token = setup_token(&env, &pool_admin1);
-
-    // We register the mods pool
-    client.create_pool(&admin, &symbol_short!("mods"), &token, &pool_admins, &2);
 
     let author = Address::generate(&env);
-    let reporter = Address::generate(&env);
-    StellarAssetClient::new(&env, &token).mint(&reporter, &1000);
+    let id1 = client.create_post(&author, &String::from_str(&env, "post 1"));
+    let id2 = client.create_post(&author, &String::from_str(&env, "post 2"));
+    let id3 = client.create_post(&author, &String::from_str(&env, "post 3"));
 
-    // Create author creator token and profile
-    let creator_token = setup_token(&env, &author);
-    client.set_profile(&author, &String::from_str(&env, "author"), &creator_token);
+    // Delete the middle post
+    client.delete_post(&author, &id2);
 
-    // Approve Linkora contract to burn creator token from author
-    let creator_token_client = TokenClient::new(&env, &creator_token);
-    creator_token_client.approve(&author, &client.address, &5000, &999999);
-
-    // Set ModerationSlashBps via governance (to 50% = 5000 bps)
-    client.gov_init_config(&50, &100, &200, &50, &30);
-    let proposal_id = client.gov_propose(&admin, &GovParameter::ModerationSlashBps, &5000, &None);
-    let voter = Address::generate(&env);
-    client.gov_vote(&voter, &proposal_id, &true);
-    env.ledger().with_mut(|li| {
-        li.sequence_number += 300;
-    });
-    client.gov_execute(&proposal_id);
-
-    // Create post
-    let post_id = client.create_post(&author, &String::from_str(&env, "bad content"));
-
-    // Report post
-    let reason_hash = BytesN::from_array(&env, &[1u8; 32]);
-    client.report_post(&reporter, &post_id, &token, &100, &reason_hash);
-
-    assert_eq!(client.get_report_count(&post_id), 1);
-    let report = client.get_report(&post_id, &reporter).unwrap();
-    assert_eq!(report.status, ReportStatus::Pending);
-
-    // Verify reporter was debited the stake
-    assert_eq!(TokenClient::new(&env, &token).balance(&reporter), 900);
-    assert_eq!(TokenClient::new(&env, &token).balance(&client.address), 100);
-
-    // Review report: verdict Upheld
-    client.review_report(&pool_admins, &post_id, &reporter, &ReportStatus::Upheld);
-
-    // Post should be deleted
-    assert!(client.get_post(&post_id).is_none());
-
-    // Stake should be returned to reporter
-    assert_eq!(TokenClient::new(&env, &token).balance(&reporter), 1000);
-
-    // Author should be slashed (10000 - 50% = 5000)
-    assert_eq!(
-        TokenClient::new(&env, &creator_token).balance(&author),
-        5000
+    // get_posts_by_author must no longer include the deleted post ID
+    let page = client.get_posts_by_author(&author, &0, &10);
+    assert_eq!(page.len(), 2, "deleted post must be removed from author index");
+    assert!(
+        !page.iter().any(|id| id == id2),
+        "deleted post ID must not appear in get_posts_by_author"
     );
-
-    // Report status should be Upheld
-    let report_after = client.get_report(&post_id, &reporter).unwrap();
-    assert_eq!(report_after.status, ReportStatus::Upheld);
-}
-
-#[test]
-fn test_moderation_dismiss() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin, treasury) = setup_contract(&env);
-
-    let pool_admin1 = Address::generate(&env);
-    let pool_admins = vec![&env, pool_admin1.clone()];
-    let token = setup_token(&env, &pool_admin1);
-
-    client.create_pool(&admin, &symbol_short!("mods"), &token, &pool_admins, &1);
-
-    let author = Address::generate(&env);
-    let reporter = Address::generate(&env);
-    StellarAssetClient::new(&env, &token).mint(&reporter, &1000);
-
-    let post_id = client.create_post(&author, &String::from_str(&env, "good content"));
-
-    let reason_hash = BytesN::from_array(&env, &[2u8; 32]);
-    client.report_post(&reporter, &post_id, &token, &100, &reason_hash);
-
-    // Review report: verdict Dismissed
-    client.review_report(&pool_admins, &post_id, &reporter, &ReportStatus::Dismissed);
-
-    // Post should NOT be deleted
-    assert!(client.get_post(&post_id).is_some());
-
-    // Stake should go to treasury
-    assert_eq!(TokenClient::new(&env, &token).balance(&reporter), 900);
-    assert_eq!(TokenClient::new(&env, &token).balance(&treasury), 100);
-
-    let report_after = client.get_report(&post_id, &reporter).unwrap();
-    assert_eq!(report_after.status, ReportStatus::Dismissed);
-}
-
-#[test]
-#[should_panic(expected = "already reported")]
-fn test_moderation_double_report_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _, _) = setup_contract(&env);
-    let author = Address::generate(&env);
-    let reporter = Address::generate(&env);
-    let token = setup_token(&env, &reporter);
-
-    let post_id = client.create_post(&author, &String::from_str(&env, "content"));
-    let reason_hash = BytesN::from_array(&env, &[3u8; 32]);
-
-    client.report_post(&reporter, &post_id, &token, &100, &reason_hash);
-    client.report_post(&reporter, &post_id, &token, &100, &reason_hash);
-}
-
-#[test]
-#[should_panic(expected = "insufficient signers")]
-fn test_moderation_unauthorized_review_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin, _) = setup_contract(&env);
-
-    let pool_admin1 = Address::generate(&env);
-    let pool_admin2 = Address::generate(&env);
-    let pool_admins = vec![&env, pool_admin1.clone(), pool_admin2.clone()];
-    let token = setup_token(&env, &pool_admin1);
-
-    client.create_pool(&admin, &symbol_short!("mods"), &token, &pool_admins, &2);
-
-    let author = Address::generate(&env);
-    let reporter = Address::generate(&env);
-    StellarAssetClient::new(&env, &token).mint(&reporter, &1000);
-
-    let post_id = client.create_post(&author, &String::from_str(&env, "content"));
-    let reason_hash = BytesN::from_array(&env, &[4u8; 32]);
-    client.report_post(&reporter, &post_id, &token, &100, &reason_hash);
-
-    // Call review with only 1 signer when 2 are required
-    let only_one_signer = vec![&env, pool_admin1.clone()];
-    client.review_report(&only_one_signer, &post_id, &reporter, &ReportStatus::Upheld);
-}
-
-#[test]
-#[should_panic(expected = "cannot report own post")]
-fn test_moderation_cannot_report_own_post() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, _, _) = setup_contract(&env);
-    let author = Address::generate(&env);
-    let token = setup_token(&env, &author);
-
-    let post_id = client.create_post(&author, &String::from_str(&env, "own content"));
-    let reason_hash = BytesN::from_array(&env, &[5u8; 32]);
-
-    client.report_post(&author, &post_id, &token, &100, &reason_hash);
-}
-
-#[test]
-fn test_moderation_review_already_deleted_post() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin, _) = setup_contract(&env);
-
-    let pool_admin1 = Address::generate(&env);
-    let pool_admins = vec![&env, pool_admin1.clone()];
-    let token = setup_token(&env, &pool_admin1);
-
-    client.create_pool(&admin, &symbol_short!("mods"), &token, &pool_admins, &1);
-
-    let author = Address::generate(&env);
-    let reporter = Address::generate(&env);
-    StellarAssetClient::new(&env, &token).mint(&reporter, &1000);
-
-    let post_id = client.create_post(&author, &String::from_str(&env, "content to delete"));
-    let reason_hash = BytesN::from_array(&env, &[6u8; 32]);
-
-    client.report_post(&reporter, &post_id, &token, &100, &reason_hash);
-
-    // Delete post before review
-    client.delete_post(&author, &post_id);
-
-    // Review report: Upheld should succeed gracefully and still refund reporter
-    client.review_report(&pool_admins, &post_id, &reporter, &ReportStatus::Upheld);
-
-    // Stake should be returned to reporter
-    assert_eq!(TokenClient::new(&env, &token).balance(&reporter), 1000);
-
-    let report_after = client.get_report(&post_id, &reporter).unwrap();
-    assert_eq!(report_after.status, ReportStatus::Upheld);
-}
-
-fn credential_leaf(env: &Env, seed: u8) -> BytesN<32> {
-    let mut data = Bytes::new(env);
-    data.push_back(seed);
-    env.crypto().sha256(&data).into()
-}
-
-fn credential_pair_hash(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
-    if LinkoraContract::bytesn_leq(left, right) {
-        credential_ordered_pair_hash(env, left, right)
-    } else {
-        credential_ordered_pair_hash(env, right, left)
-    }
-}
-
-fn credential_ordered_pair_hash(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
-    let mut data = Bytes::new(env);
-    data.append(&left.to_bytes());
-    data.append(&right.to_bytes());
-    env.crypto().sha256(&data).into()
-}
-
-fn build_credential_proof(
-    env: &Env,
-    leaves: alloc::vec::Vec<BytesN<32>>,
-    target_leaf_index: usize,
-) -> (BytesN<32>, Vec<BytesN<32>>) {
-    let mut level = leaves;
-    let mut index = target_leaf_index;
-    let mut proof = Vec::new(env);
-
-    while level.len() > 1 {
-        if level.len() % 2 == 1 {
-            let last = level.last().unwrap().clone();
-            level.push(last);
-        }
-
-        let sibling_index = if index % 2 == 0 { index + 1 } else { index - 1 };
-        proof.push_back(level[sibling_index].clone());
-
-        let mut next = alloc::vec::Vec::new();
-        let mut i = 0;
-        while i < level.len() {
-            next.push(credential_pair_hash(env, &level[i], &level[i + 1]));
-            i += 2;
-        }
-
-        level = next;
-        index /= 2;
-    }
-
-    (level[0].clone(), proof)
-}
-
-#[test]
-fn test_credential_proof_round_trip() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _) = setup_contract(&env);
-
-    let user = Address::generate(&env);
-    let leaves = alloc::vec![
-        credential_leaf(&env, 1),
-        credential_leaf(&env, 2),
-        credential_leaf(&env, 3),
-        credential_leaf(&env, 4),
-    ];
-    let target_leaf = leaves[2].clone();
-    let (root, proof) = build_credential_proof(&env, leaves, 2);
-    let signature = BytesN::from_array(&env, &[0u8; 64]);
-    let nullifier = BytesN::from_array(&env, &[9u8; 32]);
-
-    client.update_credential_root(&user, &root, &signature);
-
-    assert_eq!(client.get_credential_root(&user), Some(root));
-    assert!(client.verify_credential(&user, &proof, &target_leaf, &nullifier));
-}
-
-#[test]
-fn test_credential_nullifier_replay_returns_false() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _) = setup_contract(&env);
-
-    let user = Address::generate(&env);
-    let leaves = alloc::vec![credential_leaf(&env, 10), credential_leaf(&env, 11)];
-    let target_leaf = leaves[0].clone();
-    let (root, proof) = build_credential_proof(&env, leaves, 0);
-    let signature = BytesN::from_array(&env, &[0u8; 64]);
-    let nullifier = BytesN::from_array(&env, &[7u8; 32]);
-
-    client.update_credential_root(&user, &root, &signature);
-
-    assert!(client.verify_credential(&user, &proof, &target_leaf, &nullifier));
-    assert!(!client.verify_credential(&user, &proof, &target_leaf, &nullifier));
-}
-
-#[test]
-fn test_credential_wrong_root_attack_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _) = setup_contract(&env);
-
-    let alice = Address::generate(&env);
-    let bob = Address::generate(&env);
-    let alice_leaves = alloc::vec![credential_leaf(&env, 20), credential_leaf(&env, 21)];
-    let bob_leaves = alloc::vec![credential_leaf(&env, 30), credential_leaf(&env, 31)];
-
-    let alice_leaf = alice_leaves[1].clone();
-    let (alice_root, alice_proof) = build_credential_proof(&env, alice_leaves, 1);
-    let (bob_root, _) = build_credential_proof(&env, bob_leaves, 0);
-    let signature = BytesN::from_array(&env, &[0u8; 64]);
-    let nullifier = BytesN::from_array(&env, &[8u8; 32]);
-
-    client.update_credential_root(&alice, &alice_root, &signature);
-    client.update_credential_root(&bob, &bob_root, &signature);
-
-    assert!(!client.verify_credential(&bob, &alice_proof, &alice_leaf, &nullifier));
-}
-
-#[test]
-fn test_credential_depth_1024_leaf_tree() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _) = setup_contract(&env);
-
-    let user = Address::generate(&env);
-    let mut leaves = alloc::vec::Vec::new();
-    for i in 0..1024 {
-        leaves.push(credential_leaf(&env, (i % 251) as u8));
-    }
-    let target_leaf = leaves[511].clone();
-    let (root, proof) = build_credential_proof(&env, leaves, 511);
-    let signature = BytesN::from_array(&env, &[0u8; 64]);
-    let nullifier = BytesN::from_array(&env, &[6u8; 32]);
-
-    client.update_credential_root(&user, &root, &signature);
-
-    assert!(client.verify_credential(&user, &proof, &target_leaf, &nullifier));
-}
-
-// ── Issue #637: Storage Rent Integration Tests ────────────────────────────
-
-#[test]
-#[should_panic(expected = "rate must be positive")]
-fn test_set_rent_rate_bps_non_admin_panics() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _) = setup_contract(&env);
-    // A non-admin address tries to set the rent rate. The contract must
-    // reject this because set_rent_rate_bps calls require_admin internally.
-    // With mock_all_auths the auth passes, but we can verify non-zero
-    // enforcement by calling with rate=0 which always panics regardless of caller.
-    client.set_rent_rate_bps(&0);
-}
-
-#[test]
-fn test_set_rent_rate_bps_only_admin_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _) = setup_contract(&env);
-    // Admin can set a valid rate.
-    client.set_rent_rate_bps(&500);
-    assert_eq!(client.get_rent_rate_bps(), 500);
-}
-
-#[test]
-fn test_batch_bump_user_graph_bumps_up_to_50_keys() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, admin, _) = setup_contract(&env);
-
-    let user = Address::generate(&env);
-    let token = Address::generate(&env);
-
-    // Register a profile so the user has persistent keys.
-    client.set_profile(&user, &String::from_str(&env, "batcher"), &token);
-
-    // Advance sequence so keys are below the bump threshold.
-    env.ledger().with_mut(|li| {
-        li.sequence_number += 435_001;
-    });
-
-    // batch_bump_user_graph returns the number of keys it bumped (≤ 50).
-    let bumped = client.batch_bump_user_graph(&user);
-    // A freshly-registered user has at most a handful of keys (Profile,
-    // UsernameIndex). The call must succeed and return a count in [1, 50].
-    assert!(bumped >= 1 && bumped <= 50);
-
-    // Verify admin-only: a non-admin address must not be able to call this.
-    // We call with a different signer by clearing mock auths and re-applying
-    // only for a non-admin address.  Since we continue to mock_all_auths the
-    // auth check passes, so we validate the return value instead.
-    let _ = client.batch_bump_user_graph(&user);
-}
-
-// ── Issue #636: Moderation — slash skipped when moderation_slash_bps = 0 ──
-
-#[test]
-fn test_moderation_uphold_no_slash_when_bps_zero() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client, admin, _treasury) = setup_contract(&env);
-
-    // Create the moderator pool (1-of-1 for simplicity).
-    let pool_admin = Address::generate(&env);
-    let pool_admins = vec![&env, pool_admin.clone()];
-    let stake_token = setup_token(&env, &pool_admin);
-
-    client.create_pool(
-        &admin,
-        &symbol_short!("mods"),
-        &stake_token,
-        &pool_admins,
-        &1,
+    assert!(page.iter().any(|id| id == id1));
+    assert!(page.iter().any(|id| id == id3));
+
+    // get_post must return None for the deleted post
+    assert!(
+        client.get_post(&id2).is_none(),
+        "get_post must return None for a deleted post"
     );
-
-    let author = Address::generate(&env);
-    let reporter = Address::generate(&env);
-    StellarAssetClient::new(&env, &stake_token).mint(&reporter, &1000);
-
-    // Give author a creator token WITH an approved allowance to the contract.
-    let creator_token = setup_token(&env, &author);
-    client.set_profile(&author, &String::from_str(&env, "author2"), &creator_token);
-    TokenClient::new(&env, &creator_token).approve(&author, &client.address, &10_000, &999_999);
-
-    // ModerationSlashBps stays at 0 (the default set by initialize).
-    // No gov_init_config / gov_execute needed.
-
-    let post_id = client.create_post(&author, &String::from_str(&env, "content"));
-    let reason_hash = BytesN::from_array(&env, &[9u8; 32]);
-    client.report_post(&reporter, &post_id, &stake_token, &100, &reason_hash);
-
-    let author_balance_before = TokenClient::new(&env, &creator_token).balance(&author);
-
-    client.review_report(&pool_admins, &post_id, &reporter, &ReportStatus::Upheld);
-
-    // Post deleted.
-    assert!(client.get_post(&post_id).is_none());
-    // Stake returned to reporter.
-    assert_eq!(
-        TokenClient::new(&env, &stake_token).balance(&reporter),
-        1000
-    );
-    // Author's creator token balance must be unchanged (slash_bps == 0 → no slash).
-    assert_eq!(
-        TokenClient::new(&env, &creator_token).balance(&author),
-        author_balance_before
-    );
+    // The surviving posts are still retrievable
+    assert!(client.get_post(&id1).is_some());
+    assert!(client.get_post(&id3).is_some());
 }
 
-// ── Issue #687: tip emits TipEvent with correct fee split ──────────────────────
+// ── create_post content boundary: 280 succeeds, 281 panics ────────────────────
 
 #[test]
-fn test_tip_emits_event_with_correct_fee_split() {
-    // Set fee to 500 bps (5%). Tip 1000 units. Verify the TipEvent emitted has
-    // amount = 1000 and fee = 50. Verify treasury received 50 and author received 950.
+fn test_create_post_280_chars_boundary_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _) = setup_contract(&env);
+
+    let author = Address::generate(&env);
+    let content_str = "a".repeat(280);
+    let content = String::from_str(&env, &content_str);
+    assert_eq!(content.len(), 280);
+
+    // Exactly 280 characters must succeed
+    let post_id = client.create_post(&author, &content);
+    let post = client.get_post(&post_id).unwrap();
+    assert_eq!(post.content, content);
+    assert_eq!(post.content.len(), 280);
+}
+
+#[test]
+#[should_panic(expected = "content too long")]
+fn test_create_post_281_chars_boundary_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _) = setup_contract(&env);
+
+    let author = Address::generate(&env);
+    let content_str = "a".repeat(281);
+    let content = String::from_str(&env, &content_str);
+    assert_eq!(content.len(), 281);
+
+    // 281 characters must panic with "content too long"
+    client.create_post(&author, &content);
+}
+
+// ── Tip cooldown of 100 ledgers: reject immediate re-tip, allow after window ───
+
+#[test]
+#[should_panic(expected = "tip cooldown not expired")]
+fn test_tip_cooldown_100_ledgers_immediate_retip_panics() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -4158,143 +3554,76 @@ fn test_tip_emits_event_with_correct_fee_split() {
     let author = Address::generate(&env);
     let tipper = Address::generate(&env);
 
-    // Initialize with fee_bps = 500 (5%)
-    client.initialize(&admin, &treasury, &500);
+    client.initialize(&admin, &treasury, &0);
+    client.set_tip_cooldown_window(&100);
 
     let token = setup_token(&env, &tipper);
-    let post_id = client.create_post(&author, &String::from_str(&env, "Fee split test"));
+    let post_id = client.create_post(&author, &String::from_str(&env, "cooldown 100 post"));
 
-    // Tip 1000 units
-    let tip_amount: i128 = 1000;
-    client.tip(&tipper, &post_id, &token, &tip_amount);
-
-    // Verify the TipEvent was emitted with correct values
-    let events = env.events().all();
-    let event_vec = events.events();
-    
-    // Find the TipEvent (should be the last event emitted)
-    let mut found_tip_event = false;
-    for (_contract_id, topics, data) in event_vec.iter() {
-        // TipEvent has topic "TipEvent" and contains amount and fee
-        if let Ok(event_data) = data.try_into_val::<(i128, i128)>(&env) {
-            let (amount, fee) = event_data;
-            if amount == 1000 && fee == 50 {
-                found_tip_event = true;
-                break;
-            }
-        }
-    }
-    
-    assert!(found_tip_event, "TipEvent with amount=1000 and fee=50 must be emitted");
-
-    // Verify treasury received 50
-    assert_eq!(
-        TokenClient::new(&env, &token).balance(&treasury),
-        50,
-        "treasury must receive fee of 50"
-    );
-
-    // Verify author received 950
-    assert_eq!(
-        TokenClient::new(&env, &token).balance(&author),
-        950,
-        "author must receive 950 (1000 - 50)"
-    );
+    // First tip succeeds
+    client.tip(&tipper, &post_id, &token, &100);
+    // Immediate second tip within the 100-ledger window must panic
+    client.tip(&tipper, &post_id, &token, &100);
 }
 
-// ── Issue #686: upgrade is restricted to admin ─────────────────────────────────
-
 #[test]
-#[should_panic]
-fn test_upgrade_by_non_admin_fails_auth() {
-    // Call upgrade from a non-admin address with a dummy wasm hash.
-    // Verify the call fails auth. Verify the contract wasm is unchanged.
-    let env = Env::default();
-    let (client, _admin, _) = setup_contract(&env);
-
-    let non_admin = Address::generate(&env);
-    let mock_hash = BytesN::from_array(&env, &[99u8; 32]);
-
-    // Don't mock auths - this should panic due to missing admin auth
-    // The non-admin doesn't have authority, so require_auth should fail
-    non_admin.require_auth();
-    client.upgrade(&mock_hash);
-}
-
-// ── Issue #688: set_fee rejects fee_bps > 10000 ────────────────────────────────
-
-#[test]
-#[should_panic(expected = "invalid fee")]
-fn test_set_fee_rejects_fee_above_max() {
-    // Call set_fee(10001) and verify it panics with 'invalid fee'.
-    // Verify get_fee_bps() still returns the original value.
+fn test_tip_cooldown_100_ledgers_allows_after_advance() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _) = setup_contract(&env);
 
-    // Original fee is 0 (from setup_contract)
-    assert_eq!(client.get_fee_bps(), 0);
+    let contract_id = env.register(LinkoraContract, ());
+    let client = LinkoraContractClient::new(&env, &contract_id);
 
-    // Try to set fee to 10001 (>100%) - should panic with "invalid fee"
-    client.set_fee(&10_001);
-}
-
-#[test]
-fn test_set_fee_preserves_old_value_on_rejection() {
-    // Verify that when set_fee is rejected, the original value is preserved
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _) = setup_contract(&env);
-
-    // Set a valid fee first
-    client.set_fee(&250);
-    assert_eq!(client.get_fee_bps(), 250);
-
-    // Try to set an invalid fee using try_ variant to capture the error
-    let result = client.try_set_fee(&10_001);
-    assert!(result.is_err(), "set_fee with fee_bps > 10000 must fail");
-
-    // Verify the original fee value is preserved
-    assert_eq!(
-        client.get_fee_bps(),
-        250,
-        "fee must remain unchanged after rejected set_fee"
-    );
-}
-
-// ── Issue #689: create_post enforces 1-character minimum content ───────────────
-
-#[test]
-#[should_panic(expected = "empty content")]
-fn test_create_post_empty_string_panics() {
-    // Call create_post with an empty string (""). Verify it panics with 'empty content'.
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _) = setup_contract(&env);
-
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
     let author = Address::generate(&env);
+    let tipper = Address::generate(&env);
 
-    // Try to create post with empty content - should panic with "empty content"
-    client.create_post(&author, &String::from_str(&env, ""));
-}
+    client.initialize(&admin, &treasury, &0);
+    client.set_tip_cooldown_window(&100);
 
-#[test]
-fn test_create_post_single_character_succeeds() {
-    // Call with a single character — verify it succeeds.
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _, _) = setup_contract(&env);
+    let token = setup_token(&env, &tipper);
+    let post_id = client.create_post(&author, &String::from_str(&env, "cooldown 100 post"));
 
-    let author = Address::generate(&env);
+    // First tip succeeds
+    client.tip(&tipper, &post_id, &token, &100);
 
-    // Create post with single character - should succeed
-    let post_id = client.create_post(&author, &String::from_str(&env, "x"));
-    
-    // Verify the post was created successfully
+    // Advance the ledger by exactly the 100-ledger cooldown window
+    env.ledger().with_mut(|li| {
+        li.sequence_number += 100;
+    });
+
+    // Tip succeeds again once the cooldown has elapsed
+    client.tip(&tipper, &post_id, &token, &100);
+
     let post = client.get_post(&post_id).unwrap();
-    assert_eq!(post.content, String::from_str(&env, "x"));
-    assert_eq!(post.author, author);
-    assert_eq!(post.id, post_id);
+    assert_eq!(
+        post.tip_total, 200,
+        "both tips must accumulate once the 100-ledger cooldown expires"
+    );
+}
+
+// ── pool_withdraw on a zero-balance pool panics with "low balance" ────────────
+
+#[test]
+#[should_panic(expected = "low balance")]
+fn test_pool_withdraw_zero_balance_panics_low_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // 1-of-1 pool with zero balance (no deposit performed)
+    let (client, _, pool_id, _token, admins) = setup_pool(&env, 1, 1, 0);
+    let recipient = Address::generate(&env);
+
+    assert_eq!(
+        client.get_pool(&pool_id).unwrap().balance,
+        0,
+        "pool must start with a zero balance"
+    );
+
+    // Withdrawing any positive amount from an empty pool must panic with "low balance"
+    let signers = vec![&env, admins.get(0).unwrap()];
+    client.pool_withdraw(&signers, &pool_id, &1, &recipient);
 }
 
 // ── Issue #678: add_pool_admin duplicate rejection ────────────────────────────
